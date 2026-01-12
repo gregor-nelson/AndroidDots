@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"\nimport re\nwith open\\(''/data/data/com.termux/files/home/.config/tmux/git.sh'', ''r''\\) as f:\n    content = f.read\\(\\)\n    # Find lines with icon definitions\n    matches = re.findall\\(r\"\"''\\(@tmux2k[^'']+\\)'' ''\\([^'']+\\)''\"\", content\\)\n    for name, icon in matches:\n        print\\(f''{name}: {icon}''\\)\n\")"
+    ]
+  }
+}

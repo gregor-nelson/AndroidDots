@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "/data/data/com.termux/files/home/.claude-statusline.sh"
+  }
+}
