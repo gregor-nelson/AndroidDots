@@ -12,6 +12,7 @@ blue="#7aa2f7"
 red="#d47d85"
 darkblue="#668ee3"
 yellow="#e5c07b"
+pink="#c678dd"
 
 # Icons
 mem_icon="󰍛"
@@ -34,23 +35,32 @@ pill() {
     printf "#[fg=%s,bg=%s] %s #[fg=%s,bg=%s] %s " "$label_fg" "$label_bg" "$label" "$white" "$grey" "$value"
 }
 
-# CPU temperature
+# CPU temperature and load
 cpu() {
-    local temp_raw temp
-    temp_raw=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)
-    if [ -n "$temp_raw" ]; then
-        temp="$((temp_raw / 1000))°C"
+    local max_temp=0 temp_raw load_avg
+    for zone in /sys/class/thermal/thermal_zone*/; do
+        type=$(cat "${zone}type" 2>/dev/null)
+        if [[ "$type" == cpu* ]]; then
+            temp_raw=$(cat "${zone}temp" 2>/dev/null)
+            if [ -n "$temp_raw" ] && [ "$temp_raw" -gt "$max_temp" ]; then
+                max_temp="$temp_raw"
+            fi
+        fi
+    done
+    load_avg=$(uptime | awk -F'load average: ' '{print $2}' | cut -d',' -f1)
+    if [ "$max_temp" -gt 0 ]; then
+        printf "#[fg=%s,bg=%s] CPU #[fg=%s,bg=%s] %s°C %s " "$black" "$green" "$white" "$grey" "$((max_temp / 1000))" "$load_avg"
     else
-        temp="--"
+        printf "#[fg=%s,bg=%s] CPU #[fg=%s,bg=%s] -- %s " "$black" "$green" "$white" "$grey" "$load_avg"
     fi
-    pill "$green" "$black" "CPU" "$temp"
 }
 
 # Memory usage
 mem() {
-    local used
+    local used total
     used=$(free -h | awk '/^Mem/ { print $3 }' | sed 's/i//g')
-    printf "#[fg=%s,bg=%s] %s #[fg=%s,bg=%s] %s " "$green" "$grey" "$mem_icon" "$white" "$grey" "$used"
+    total=$(free -h | awk '/^Mem/ { print $2 }' | sed 's/i//g')
+    printf "#[fg=%s,bg=%s] %s #[fg=%s,bg=%s] %s/%s " "$pink" "$grey" "$mem_icon" "$white" "$grey" "$used" "$total"
 }
 
 # WiFi signal strength
