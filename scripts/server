@@ -1,0 +1,704 @@
+#!/bin/sh
+
+# ============================================
+# Simple HTTP Server - A portable shell-based web server
+# ============================================
+
+VERSION="1.1.0"
+PORT=8080
+ROOT="."
+INDEX="index.html"
+VERBOSE=0
+LOG_FILE=""
+INTERACTIVE=0
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TMP_DIR="${SCRIPT_DIR}/server_tmp"
+
+# Detect gum availability
+HAS_GUM=0
+if command -v gum >/dev/null 2>&1; then
+  HAS_GUM=1
+fi
+
+# Colors (disable if not terminal)
+if [ -t 1 ]; then
+  RED='\033[0;31m'
+  GREEN='\033[0;32m'
+  YELLOW='\033[0;33m'
+  BLUE='\033[0;34m'
+  CYAN='\033[0;36m'
+  MAGENTA='\033[0;35m'
+  BOLD='\033[1m'
+  DIM='\033[2m'
+  NC='\033[0m'
+else
+  RED='' GREEN='' YELLOW='' BLUE='' CYAN='' MAGENTA='' BOLD='' DIM='' NC=''
+fi
+
+# Nerd Font Icons
+ICON_SERVER="󰒋"
+ICON_NETWORK="󰛳"
+ICON_LOCAL="󰆧"
+ICON_FOLDER="󰝰"
+ICON_FILE="󰈙"
+ICON_START="󰐊"
+ICON_STOP="󰓛"
+ICON_PORT="󰙜"
+ICON_SUCCESS="󰄬"
+ICON_ERROR="󰅖"
+ICON_WARN="󰀦"
+ICON_INFO="󰋼"
+ICON_GLOBE="󰖟"
+ICON_EXIT="󰍃"
+ICON_EYE="󰈈"
+ICON_BOLT="󰚥"
+ICON_GEAR="󰒓"
+ICON_LOG="󰷐"
+ICON_CLOCK="󰥔"
+
+# ============================================
+# TUI Helpers (gum with fallback)
+# ============================================
+ui_header() {
+  if [ "$HAS_GUM" = 1 ]; then
+    gum style --border double --border-foreground 212 --padding "0 2" --margin "1 0" "${ICON_SERVER}  $1"
+  else
+    echo ""
+    echo "${MAGENTA}╔════════════════════════════════════════════════╗${NC}"
+    printf "${MAGENTA}║${NC}  ${CYAN}${ICON_SERVER}${NC}  %-40s  ${MAGENTA}║${NC}\n" "$1"
+    echo "${MAGENTA}╚════════════════════════════════════════════════════╝${NC}"
+    echo ""
+  fi
+}
+
+ui_info() {
+  if [ "$HAS_GUM" = 1 ]; then
+    gum style --foreground 117 "  ${ICON_INFO}  $1"
+  else
+    echo "  ${CYAN}${ICON_INFO}  $1${NC}"
+  fi
+}
+
+ui_success() {
+  if [ "$HAS_GUM" = 1 ]; then
+    gum style --foreground 78 "${ICON_SUCCESS}  $1"
+  else
+    echo "${GREEN}${ICON_SUCCESS}  $1${NC}"
+  fi
+}
+
+ui_error() {
+  if [ "$HAS_GUM" = 1 ]; then
+    gum style --foreground 196 "${ICON_ERROR}  $1"
+  else
+    echo "${RED}${ICON_ERROR}  $1${NC}"
+  fi
+}
+
+ui_warn() {
+  if [ "$HAS_GUM" = 1 ]; then
+    gum style --foreground 214 "${ICON_WARN}  $1"
+  else
+    echo "${YELLOW}${ICON_WARN}  $1${NC}"
+  fi
+}
+
+ui_input() {
+  prompt="$1"
+  default="$2"
+  if [ "$HAS_GUM" = 1 ]; then
+    gum input --placeholder "$default" --prompt "$prompt " --value "$default"
+  else
+    printf "%s [%s]: " "$prompt" "$default"
+    read -r input
+    echo "${input:-$default}"
+  fi
+}
+
+ui_confirm() {
+  prompt="$1"
+  if [ "$HAS_GUM" = 1 ]; then
+    gum confirm "$prompt" && echo "yes" || echo "no"
+  else
+    printf "%s [y/N]: " "$prompt"
+    read -r yn
+    case "$yn" in
+      [Yy]*) echo "yes" ;;
+      *) echo "no" ;;
+    esac
+  fi
+}
+
+ui_choose() {
+  if [ "$HAS_GUM" = 1 ]; then
+    echo "$@" | tr ' ' '\n' | gum choose
+  else
+    i=1
+    for opt in "$@"; do
+      echo "  $i) $opt"
+      i=$((i + 1))
+    done
+    printf "Choice: "
+    read -r choice
+    i=1
+    for opt in "$@"; do
+      [ "$i" = "$choice" ] && echo "$opt" && return
+      i=$((i + 1))
+    done
+    echo "$1"  # default to first
+  fi
+}
+
+ui_spin() {
+  msg="$1"
+  shift
+  if [ "$HAS_GUM" = 1 ]; then
+    gum spin --spinner dot --title "$msg" -- "$@"
+  else
+    printf "%s... " "$msg"
+    "$@"
+    echo "done"
+  fi
+}
+
+ui_file_picker() {
+  start_dir="${1:-.}"
+  if [ "$HAS_GUM" = 1 ]; then
+    gum file --directory "$start_dir"
+  else
+    printf "Enter path [%s]: " "$start_dir"
+    read -r path
+    echo "${path:-$start_dir}"
+  fi
+}
+
+# ============================================
+# MIME Types
+# ============================================
+get_mime_type() {
+  case "$1" in
+    *.html|*.htm) echo "text/html" ;;
+    *.css)        echo "text/css" ;;
+    *.js)         echo "application/javascript" ;;
+    *.json)       echo "application/json" ;;
+    *.xml)        echo "application/xml" ;;
+    *.txt)        echo "text/plain" ;;
+    *.md)         echo "text/markdown" ;;
+    *.csv)        echo "text/csv" ;;
+    *.png)        echo "image/png" ;;
+    *.jpg|*.jpeg) echo "image/jpeg" ;;
+    *.gif)        echo "image/gif" ;;
+    *.svg)        echo "image/svg+xml" ;;
+    *.ico)        echo "image/x-icon" ;;
+    *.webp)       echo "image/webp" ;;
+    *.woff)       echo "font/woff" ;;
+    *.woff2)      echo "font/woff2" ;;
+    *.ttf)        echo "font/ttf" ;;
+    *.otf)        echo "font/otf" ;;
+    *.eot)        echo "application/vnd.ms-fontobject" ;;
+    *.pdf)        echo "application/pdf" ;;
+    *.zip)        echo "application/zip" ;;
+    *.gz)         echo "application/gzip" ;;
+    *.tar)        echo "application/x-tar" ;;
+    *.mp3)        echo "audio/mpeg" ;;
+    *.mp4)        echo "video/mp4" ;;
+    *.webm)       echo "video/webm" ;;
+    *.ogg)        echo "audio/ogg" ;;
+    *.wav)        echo "audio/wav" ;;
+    *.wasm)       echo "application/wasm" ;;
+    *)            echo "application/octet-stream" ;;
+  esac
+}
+
+# ============================================
+# Logging
+# ============================================
+log() {
+  timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+  msg="[${ICON_CLOCK} ${timestamp}] $1"
+  echo "$msg"
+  [ -n "$LOG_FILE" ] && echo "$msg" >> "$LOG_FILE"
+}
+
+log_request() {
+  method="$1"
+  path="$2"
+  status="$3"
+  size="$4"
+
+  case "$status" in
+    200) color="$GREEN"; icon="$ICON_SUCCESS" ;;
+    301|302|304) color="$CYAN"; icon="$ICON_INFO" ;;
+    404) color="$YELLOW"; icon="$ICON_WARN" ;;
+    *) color="$RED"; icon="$ICON_ERROR" ;;
+  esac
+
+  log "${color}${icon} ${status}${NC} ${method} ${path} (${size} bytes)"
+}
+
+# ============================================
+# HTTP Responses
+# ============================================
+send_response() {
+  status="$1"
+  content_type="$2"
+  body="$3"
+  extra_headers="$4"
+
+  size=${#body}
+
+  printf "HTTP/1.1 %s\r\n" "$status"
+  printf "Content-Type: %s\r\n" "$content_type"
+  printf "Content-Length: %d\r\n" "$size"
+  printf "Connection: close\r\n"
+  printf "Server: SimpleHTTP/%s\r\n" "$VERSION"
+  printf "Date: %s\r\n" "$(date -u '+%a, %d %b %Y %H:%M:%S GMT')"
+  printf "Cache-Control: no-cache\r\n"
+  printf "Access-Control-Allow-Origin: *\r\n"
+  [ -n "$extra_headers" ] && printf "%s\r\n" "$extra_headers"
+  printf "\r\n"
+  printf "%s" "$body"
+}
+
+send_file() {
+  filepath="$1"
+  mime=$(get_mime_type "$filepath")
+  size=$(wc -c < "$filepath" | tr -d ' ')
+
+  printf "HTTP/1.1 200 OK\r\n"
+  printf "Content-Type: %s\r\n" "$mime"
+  printf "Content-Length: %d\r\n" "$size"
+  printf "Connection: close\r\n"
+  printf "Server: SimpleHTTP/%s\r\n" "$VERSION"
+  printf "Date: %s\r\n" "$(date -u '+%a, %d %b %Y %H:%M:%S GMT')"
+  printf "Cache-Control: max-age=3600\r\n"
+  printf "Access-Control-Allow-Origin: *\r\n"
+  printf "\r\n"
+  cat "$filepath"
+}
+
+send_404() {
+  body="<!DOCTYPE html>
+<html><head><title>404 Not Found</title>
+<style>body{font-family:-apple-system,sans-serif;text-align:center;padding:50px;background:#0f0f23;color:#eee}
+.icon{font-size:80px;margin-bottom:10px;opacity:0.8}
+h1{font-size:72px;margin:0;color:#e94560}
+p{color:#888;margin-top:20px}
+a{color:#00d4ff;text-decoration:none}
+a:hover{text-decoration:underline}
+</style></head>
+<body><div class=\"icon\">󰀦</div><h1>404</h1><p>The requested resource was not found.</p><p><a href=\"/\">󰁍 Back to home</a></p></body></html>"
+  send_response "404 Not Found" "text/html" "$body"
+}
+
+send_directory_listing() {
+  dir="$1"
+  reqpath="$2"
+
+  # Build HTML listing
+  body="<!DOCTYPE html>
+<html><head><title>Index of ${reqpath}</title>
+<style>
+body{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:20px;background:#0f0f23;color:#ccc}
+h1{color:#00d4ff;border-bottom:1px solid #333;padding-bottom:10px}
+h1::before{content:'󰝰 ';color:#ffd700}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid #222}
+th{color:#888;font-weight:normal;font-size:0.9em}
+a{color:#00d4ff;text-decoration:none}
+a:hover{text-decoration:underline;color:#5af}
+.size{color:#888;text-align:right}
+.date{color:#666}
+.dir{color:#ffd700}
+.dir::before{content:'󰝰 ';opacity:0.8}
+.file::before{content:'󰈙 ';opacity:0.6;color:#888}
+tr:hover{background:#1a1a3e}
+.back::before{content:'󰁍 ';opacity:0.6}
+</style></head>
+<body><h1>Index of ${reqpath}</h1>
+<table><tr><th>Name</th><th>Size</th><th>Modified</th></tr>"
+
+  # Parent directory link
+  if [ "$reqpath" != "/" ]; then
+    parent=$(dirname "$reqpath")
+    [ "$parent" = "." ] && parent="/"
+    body="${body}<tr><td><a class=\"back\" href=\"${parent}\">..</a></td><td>-</td><td>-</td></tr>"
+  fi
+
+  # List directories first, then files
+  for entry in "$dir"/*; do
+    [ -e "$entry" ] || continue
+    name=$(basename "$entry")
+
+    if [ -d "$entry" ]; then
+      moddate=$(date -r "$entry" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "-")
+      body="${body}<tr><td><a class=\"dir\" href=\"${reqpath%/}/${name}/\">${name}/</a></td><td>-</td><td class=\"date\">${moddate}</td></tr>"
+    fi
+  done
+
+  for entry in "$dir"/*; do
+    [ -e "$entry" ] || continue
+    name=$(basename "$entry")
+
+    if [ -f "$entry" ]; then
+      size=$(wc -c < "$entry" | tr -d ' ')
+      # Human readable size
+      if [ "$size" -gt 1073741824 ]; then
+        hsize="$(echo "$size" | awk '{printf "%.1fG", $1/1073741824}')"
+      elif [ "$size" -gt 1048576 ]; then
+        hsize="$(echo "$size" | awk '{printf "%.1fM", $1/1048576}')"
+      elif [ "$size" -gt 1024 ]; then
+        hsize="$(echo "$size" | awk '{printf "%.1fK", $1/1024}')"
+      else
+        hsize="${size}B"
+      fi
+      moddate=$(date -r "$entry" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "-")
+      body="${body}<tr><td><a class=\"file\" href=\"${reqpath%/}/${name}\">${name}</a></td><td class=\"size\">${hsize}</td><td class=\"date\">${moddate}</td></tr>"
+    fi
+  done
+
+  body="${body}</table></body></html>"
+  send_response "200 OK" "text/html" "$body"
+}
+
+# ============================================
+# Request Handler
+# ============================================
+handle_request() {
+  # Read request line
+  read -r request_line
+
+  # Parse method and path
+  method=$(echo "$request_line" | cut -d' ' -f1)
+  rawpath=$(echo "$request_line" | cut -d' ' -f2)
+
+  # Skip headers
+  while read -r header; do
+    header=$(echo "$header" | tr -d '\r')
+    [ -z "$header" ] && break
+  done
+
+  # URL decode and remove query string
+  reqpath=$(echo "$rawpath" | cut -d'?' -f1 | sed 's/%20/ /g; s/%2F/\//g; s/+/ /g')
+
+  # Security: prevent directory traversal
+  case "$reqpath" in
+    *..*)
+      send_response "403 Forbidden" "text/plain" "Forbidden"
+      log_request "$method" "$rawpath" "403" "9"
+      return
+      ;;
+  esac
+
+  # Resolve full path
+  if [ "$reqpath" = "/" ]; then
+    fullpath="$ROOT"
+  else
+    fullpath="${ROOT}${reqpath}"
+  fi
+
+  # Handle request
+  if [ -d "$fullpath" ]; then
+    # Check for index file
+    if [ -f "${fullpath%/}/${INDEX}" ]; then
+      fullpath="${fullpath%/}/${INDEX}"
+      send_file "$fullpath"
+      size=$(wc -c < "$fullpath" | tr -d ' ')
+      log_request "$method" "$rawpath" "200" "$size"
+    else
+      # Directory listing
+      send_directory_listing "$fullpath" "$reqpath"
+      log_request "$method" "$rawpath" "200" "listing"
+    fi
+  elif [ -f "$fullpath" ]; then
+    send_file "$fullpath"
+    size=$(wc -c < "$fullpath" | tr -d ' ')
+    log_request "$method" "$rawpath" "200" "$size"
+  else
+    send_404
+    log_request "$method" "$rawpath" "404" "0"
+  fi
+}
+
+# ============================================
+# Main Server Loop
+# ============================================
+show_help() {
+  cat << EOF
+SimpleHTTP Server v${VERSION}
+
+Usage: server [OPTIONS] [PATH]
+
+Arguments:
+  PATH                  File or directory to serve (default: current directory)
+
+Options:
+  -p, --port PORT       Port to listen on (default: 8080)
+  -i, --index FILE      Index file name (default: index.html)
+  -l, --log FILE        Log requests to file
+  -v, --verbose         Verbose output
+  -I, --interactive     Interactive mode with TUI menu
+  -h, --help            Show this help message
+  -V, --version         Show version
+
+Examples:
+  server                      # Serve current directory on port 8080
+  server -I                   # Interactive mode (uses gum if available)
+  server ./site               # Serve ./site directory
+  server -p 3000 ./dist       # Serve ./dist on port 3000
+  server index.html           # Serve single file
+  server -l access.log ./     # Serve with logging
+
+EOF
+}
+
+# ============================================
+# Interactive Menu
+# ============================================
+show_status() {
+  clear
+  ui_header "SimpleHTTP Server v${VERSION}"
+  echo ""
+  if [ "$HAS_GUM" = 1 ]; then
+    gum style --foreground 212 "  ${ICON_BOLT}  Status: Running"
+    echo ""
+    gum style --foreground 117 "  ${ICON_LOCAL}  Local:    http://localhost:${PORT}"
+    gum style --foreground 117 "  ${ICON_NETWORK}  Network:  http://${LOCAL_IP}:${PORT}"
+    echo ""
+    gum style --foreground 78 "  ${ICON_FOLDER}  Serving:  ${ROOT}"
+    [ -n "$SINGLE_FILE" ] && gum style --foreground 78 "  ${ICON_FILE}  File:     ${INDEX}"
+  else
+    echo "  ${GREEN}${ICON_BOLT}  Status: Running${NC}"
+    echo ""
+    echo "  ${CYAN}${ICON_LOCAL}  Local:${NC}    http://localhost:${PORT}"
+    echo "  ${CYAN}${ICON_NETWORK}  Network:${NC}  http://${LOCAL_IP}:${PORT}"
+    echo ""
+    echo "  ${BLUE}${ICON_FOLDER}  Serving:${NC}  ${ROOT}"
+    [ -n "$SINGLE_FILE" ] && echo "  ${BLUE}${ICON_FILE}  File:${NC}     ${INDEX}"
+  fi
+  echo ""
+}
+
+interactive_menu() {
+  while true; do
+    clear
+    ui_header "SimpleHTTP Server v${VERSION}"
+
+    if [ "$HAS_GUM" = 1 ]; then
+      echo ""
+      gum style --foreground 245 "  ${ICON_GEAR}  Current settings:"
+      gum style "     ${ICON_PORT}  Port: ${PORT}    ${ICON_FOLDER}  Directory: ${ROOT}"
+      echo ""
+    else
+      echo ""
+      echo "  ${DIM}${ICON_GEAR}  Current settings:${NC}"
+      echo "     ${CYAN}${ICON_PORT}${NC}  Port: ${CYAN}${PORT}${NC}    ${CYAN}${ICON_FOLDER}${NC}  Directory: ${CYAN}${ROOT}${NC}"
+      echo ""
+    fi
+
+    action=$(ui_choose "${ICON_START} Start Server" "${ICON_PORT} Change Port" "${ICON_FOLDER} Change Directory" "${ICON_EYE} Toggle Verbose" "${ICON_EXIT} Quit")
+
+    case "$action" in
+      *"Start Server")
+        start_server
+        ;;
+      *"Change Port")
+        PORT=$(ui_input "${ICON_PORT}  Port:" "$PORT")
+        ;;
+      *"Change Directory")
+        if [ "$HAS_GUM" = 1 ]; then
+          ROOT=$(gum file --directory)
+        else
+          ROOT=$(ui_file_picker "$ROOT")
+        fi
+        ;;
+      *"Toggle Verbose")
+        if [ "$VERBOSE" = 1 ]; then
+          VERBOSE=0
+          ui_info "Verbose mode: OFF"
+        else
+          VERBOSE=1
+          ui_info "Verbose mode: ON"
+        fi
+        sleep 1
+        ;;
+      *"Quit")
+        ui_success "Goodbye!"
+        exit 0
+        ;;
+    esac
+  done
+}
+
+start_server() {
+  # Resolve root path
+  if [ -f "$ROOT" ]; then
+    SINGLE_FILE="$ROOT"
+    ROOT=$(dirname "$ROOT")
+    INDEX=$(basename "$SINGLE_FILE")
+  fi
+
+  ROOT=$(cd "$ROOT" 2>/dev/null && pwd) || {
+    ui_error "Cannot access '$ROOT'"
+    sleep 2
+    return
+  }
+
+  # Check for netcat
+  if ! command -v nc >/dev/null 2>&1; then
+    ui_error "netcat (nc) is required but not installed"
+    ui_info "Install with: pkg install netcat-openbsd"
+    sleep 3
+    return
+  fi
+
+  LOCAL_IP=$(get_local_ip)
+
+  # Show server info
+  show_status
+
+  if [ "$HAS_GUM" = 1 ]; then
+    gum style --foreground 214 "  ${ICON_STOP}  Press Ctrl+C to stop"
+  else
+    echo "${YELLOW}  ${ICON_STOP}  Press Ctrl+C to stop${NC}"
+  fi
+  echo ""
+
+  # Create tmp directory and FIFO
+  mkdir -p "$TMP_DIR"
+  FIFO="${TMP_DIR}/httpfifo_$$"
+  rm -f "$FIFO"
+  mkfifo "$FIFO"
+
+  # Main server loop
+  trap 'echo ""; rm -f "$FIFO"; rmdir "$TMP_DIR" 2>/dev/null; ui_warn "Server stopped"; return 2>/dev/null || exit 0' INT TERM
+
+  while true; do
+    cat "$FIFO" | nc -l -p "$PORT" | handle_request > "$FIFO" 2>/dev/null
+  done
+}
+
+get_local_ip() {
+  ip route get 1 2>/dev/null | awk '{print $7; exit}' || \
+  hostname -I 2>/dev/null | awk '{print $1}' || \
+  echo "localhost"
+}
+
+cleanup() {
+  echo ""
+  log "${YELLOW}Server stopped${NC}"
+  exit 0
+}
+
+# Parse arguments
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--port)
+      PORT="$2"
+      shift 2
+      ;;
+    -i|--index)
+      INDEX="$2"
+      shift 2
+      ;;
+    -l|--log)
+      LOG_FILE="$2"
+      shift 2
+      ;;
+    -v|--verbose)
+      VERBOSE=1
+      shift
+      ;;
+    -I|--interactive)
+      INTERACTIVE=1
+      shift
+      ;;
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    -V|--version)
+      echo "SimpleHTTP Server v${VERSION}"
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1"
+      show_help
+      exit 1
+      ;;
+    *)
+      ROOT="$1"
+      shift
+      ;;
+  esac
+done
+
+# Interactive mode
+if [ "$INTERACTIVE" = 1 ]; then
+  interactive_menu
+  exit 0
+fi
+
+# Resolve root path
+if [ -f "$ROOT" ]; then
+  # Single file mode
+  SINGLE_FILE="$ROOT"
+  ROOT=$(dirname "$ROOT")
+  INDEX=$(basename "$SINGLE_FILE")
+fi
+
+ROOT=$(cd "$ROOT" 2>/dev/null && pwd) || {
+  ui_error "Cannot access '$ROOT'"
+  exit 1
+}
+
+# Check for netcat
+if ! command -v nc >/dev/null 2>&1; then
+  ui_error "netcat (nc) is required but not installed"
+  ui_info "Install with: pkg install netcat-openbsd"
+  exit 1
+fi
+
+# Trap signals
+trap cleanup INT TERM
+
+# Get local IP
+LOCAL_IP=$(get_local_ip)
+
+# Print banner
+ui_header "SimpleHTTP Server v${VERSION}"
+echo ""
+if [ "$HAS_GUM" = 1 ]; then
+  gum style --foreground 212 "  ${ICON_BOLT}  Status: Running"
+  echo ""
+  gum style --foreground 117 "  ${ICON_LOCAL}  Local:    http://localhost:${PORT}"
+  gum style --foreground 117 "  ${ICON_NETWORK}  Network:  http://${LOCAL_IP}:${PORT}"
+  echo ""
+  gum style --foreground 78 "  ${ICON_FOLDER}  Serving:  ${ROOT}"
+  [ -n "$SINGLE_FILE" ] && gum style --foreground 78 "  ${ICON_FILE}  File:     ${INDEX}"
+  echo ""
+  gum style --foreground 214 "  ${ICON_STOP}  Press Ctrl+C to stop"
+else
+  echo "  ${GREEN}${ICON_BOLT}  Status: Running${NC}"
+  echo ""
+  echo "  ${CYAN}${ICON_LOCAL}  Local:${NC}    http://localhost:${PORT}"
+  echo "  ${CYAN}${ICON_NETWORK}  Network:${NC}  http://${LOCAL_IP}:${PORT}"
+  echo ""
+  echo "  ${BLUE}${ICON_FOLDER}  Serving:${NC}  ${ROOT}"
+  [ -n "$SINGLE_FILE" ] && echo "  ${BLUE}${ICON_FILE}  File:${NC}     ${INDEX}"
+  echo ""
+  echo "  ${YELLOW}${ICON_STOP}  Press Ctrl+C to stop${NC}"
+fi
+echo ""
+
+# Create tmp directory and FIFO
+mkdir -p "$TMP_DIR"
+FIFO="${TMP_DIR}/httpfifo_$$"
+rm -f "$FIFO"
+mkfifo "$FIFO"
+trap 'rm -f "$FIFO"; rmdir "$TMP_DIR" 2>/dev/null; cleanup' EXIT INT TERM
+
+# Main loop - fixed pipe direction
+while true; do
+  cat "$FIFO" | nc -l -p "$PORT" | handle_request > "$FIFO" 2>/dev/null
+done
